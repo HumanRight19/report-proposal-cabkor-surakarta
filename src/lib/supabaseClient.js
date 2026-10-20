@@ -11,4 +11,11 @@ if (!supabasePublishableKey) {
   throw new Error("VITE_SUPABASE_PUBLISHABLE_KEY belum diatur.");
 }
 
-export const supabase = createClient(supabaseUrl, supabasePublishableKey);
+export const supabase = createClient(supabaseUrl, supabasePublishableKey, {
+  auth: {
+    storage: window.sessionStorage,
+    persistSession: true,
+    autoRefreshToken: true,
+    detectSessionInUrl: true,
+  },
+});
