@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import * as XLSX from "xlsx";
+import * as XLSX from "xlsx-js-style";
 
 import { PRODUCTS } from "../../constants/report";
 import { formatMoneyInput, formatRupiah, parseMoney } from "../../utils/format";
