@@ -1,24 +1,60 @@
 import { useCallback, useEffect, useState } from "react";
 
+import { useContext } from "react";
+
+import { AuthContext } from "../context/AuthContext";
+
 import DashboardHeader from "../components/dashboard/DashboardHeader";
+import DashboardMenu from "../components/dashboard/DashboardMenu";
 import DashboardStats from "../components/dashboard/DashboardStats";
-import UnitSummary from "../components/dashboard/UnitSummary";
+import SupervisorFeedbackCard from "../components/dashboard/SupervisorFeedbackCard";
+import useNotifications from "../hooks/useNotifications";
+import NotificationCenter from "../components/dashboard/NotificationCenter";
+import RevisionWorkspace from "../components/dashboard/RevisionWorkspace";
+import { getRevisionItems, resubmitRevision } from "../services/revisionService";
+
 import ProposalReport from "../components/reports/ProposalReport";
 import OtsAreaReport from "../components/reports/OtsAreaReport";
 import TargetCoReport from "../components/reports/TargetCoReport";
 
 import useReportRealtime from "../hooks/useReportRealtime";
 
-import { createOtsArea, createProposal, createTargetCo, deleteOtsArea, deleteProposal, deleteTargetCo, getOtsArea, getProposals, getTargetCo } from "../services/reportService";
+import {
+  updatePendingProposal,
+  updatePendingOtsArea,
+  resubmitReport,
+  createOtsArea,
+  createProposal,
+  createTargetCo,
+  getOtsArea,
+  getProposals,
+  getTargetCo,
+  getCancellationRequests,
+  requestReportCancellation,
+  updateApprovedOtsCompleteness,
+} from "../services/reportService";
 
 function Dashboard() {
-  const [activeMenu, setActiveMenu] = useState("pusat");
+  const { user, profile } = useContext(AuthContext);
+
+  const salesUnit = profile?.role === "SALES" ? profile.unit || "" : "";
+
+  const recipientId = user?.id || null;
+
+  const { notifications, attentionNotifications, unreadCount, markAsRead, markAllAsRead } = useNotifications(recipientId);
+
+  const [activeMenu, setActiveMenu] = useState("home");
 
   const [proposals, setProposals] = useState([]);
 
   const [otsArea, setOtsArea] = useState([]);
 
   const [targetCo, setTargetCo] = useState([]);
+
+  const [cancellationRequests, setCancellationRequests] = useState([]);
+  const [cancellationLoading, setCancellationLoading] = useState(false);
+  const [cancellationSavingId, setCancellationSavingId] = useState(null);
+  const [otsCompletenessSavingId, setOtsCompletenessSavingId] = useState(null);
 
   const [loading, setLoading] = useState(true);
 
@@ -38,7 +74,19 @@ function Dashboard() {
 
   const [targetDeletingId, setTargetDeletingId] = useState(null);
 
+  const [revisionItems, setRevisionItems] = useState([]);
+  const [revisionLoading, setRevisionLoading] = useState(true);
+  const [revisionSaving, setRevisionSaving] = useState(false);
+
   const [error, setError] = useState("");
+
+  const scopedProposals = proposals.filter((row) => !salesUnit || row.unit === salesUnit);
+
+  const scopedOtsArea = otsArea.filter((row) => !salesUnit || row.unit === salesUnit);
+
+  const scopedTargetCo = targetCo.filter((row) => !salesUnit || row.unit === salesUnit);
+
+  const [revisionTarget, setRevisionTarget] = useState(null);
 
   const loadProposals = useCallback(async () => {
     try {
@@ -76,19 +124,43 @@ function Dashboard() {
     }
   }, []);
 
-  // const loadAllData = useCallback(async () => {
-  //   setError("");
+  const loadCancellationRequests = useCallback(async () => {
+    setCancellationLoading(true);
 
-  //   await Promise.all([loadProposals(), loadOtsArea(), loadTargetCo()]);
-  // }, [loadProposals, loadOtsArea, loadTargetCo]);
+    try {
+      const data = await getCancellationRequests();
+      setCancellationRequests(data || []);
+    } catch (loadError) {
+      setError(loadError.message || "Gagal memuat permintaan pembatalan laporan.");
+    } finally {
+      setCancellationLoading(false);
+    }
+  }, []);
+
+  const loadRevisionItems = useCallback(async () => {
+    if (!user?.id) {
+      setRevisionItems([]);
+      setRevisionLoading(false);
+      return;
+    }
+
+    try {
+      const data = await getRevisionItems(user.id);
+
+      setRevisionItems(data);
+    } catch (loadError) {
+      setError(loadError.message || "Gagal memuat data revisi.");
+    } finally {
+      setRevisionLoading(false);
+    }
+  }, [user?.id]);
 
   useEffect(() => {
     let cancelled = false;
 
     async function initializeDashboard() {
       try {
-        const [proposalData, otsData, targetData] = await Promise.all([getProposals(), getOtsArea(), getTargetCo()]);
-
+        const [proposalData, otsData, targetData, revisionData, cancellationData] = await Promise.all([getProposals(), getOtsArea(), getTargetCo(), user?.id ? getRevisionItems(user.id) : Promise.resolve([]), getCancellationRequests()]);
         if (cancelled) {
           return;
         }
@@ -96,6 +168,8 @@ function Dashboard() {
         setProposals(proposalData);
         setOtsArea(otsData);
         setTargetCo(targetData);
+        setRevisionItems(revisionData);
+        setCancellationRequests(cancellationData || []);
       } catch (loadError) {
         if (!cancelled) {
           setError(loadError.message || "Gagal memuat data dashboard.");
@@ -105,6 +179,7 @@ function Dashboard() {
           setLoading(false);
           setOtsLoading(false);
           setTargetLoading(false);
+          setRevisionLoading(false);
         }
       }
     }
@@ -120,7 +195,9 @@ function Dashboard() {
     loadProposals();
     loadOtsArea();
     loadTargetCo();
-  }, [loadProposals, loadOtsArea, loadTargetCo]);
+    loadRevisionItems();
+    loadCancellationRequests();
+  }, [loadProposals, loadOtsArea, loadTargetCo, loadRevisionItems, loadCancellationRequests]);
 
   useReportRealtime(handleRealtimeChange);
 
@@ -134,6 +211,23 @@ function Dashboard() {
       setError(createError.message || "Gagal menyimpan proposal.");
 
       throw createError;
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleResubmitProposal(id, payload) {
+    setSaving(true);
+    setError("");
+
+    try {
+      await resubmitReport("proposal", id, payload);
+
+      await Promise.all([loadProposals(), loadRevisionItems()]);
+    } catch (resubmitError) {
+      setError(resubmitError.message || "Gagal mengirim kembali revisi Proposal.");
+
+      throw resubmitError;
     } finally {
       setSaving(false);
     }
@@ -169,86 +263,249 @@ function Dashboard() {
     }
   }
 
-  async function handleDeleteProposal(id) {
-    setDeletingId(id);
+  async function handleRequestCancellation(entityType, entityId, reason) {
+    setCancellationSavingId(entityId);
     setError("");
 
     try {
-      await deleteProposal(id);
-    } catch (deleteError) {
-      setError(deleteError.message || "Gagal menghapus proposal.");
+      await requestReportCancellation(entityType, entityId, reason);
 
-      throw deleteError;
+      await Promise.all([loadCancellationRequests(), loadProposals(), loadOtsArea(), loadTargetCo()]);
+    } catch (requestError) {
+      setError(requestError.message || "Gagal mengajukan pembatalan laporan.");
+      throw requestError;
     } finally {
-      setDeletingId(null);
+      setCancellationSavingId(null);
     }
   }
 
-  async function handleDeleteOts(id) {
-    setOtsDeletingId(id);
+  async function handleUpdateOtsCompleteness(id, payload) {
+    setOtsCompletenessSavingId(id);
     setError("");
 
     try {
-      await deleteOtsArea(id);
-    } catch (deleteError) {
-      setError(deleteError.message || "Gagal menghapus OTS Area.");
-
-      throw deleteError;
+      await updateApprovedOtsCompleteness(id, payload);
+      await loadOtsArea();
+    } catch (updateError) {
+      setError(updateError.message || "Gagal memperbarui kelengkapan OTS Area.");
+      throw updateError;
     } finally {
-      setOtsDeletingId(null);
+      setOtsCompletenessSavingId(null);
     }
   }
 
-  async function handleDeleteTargetCo(id) {
-    setTargetDeletingId(id);
+  async function handleResubmitRevision({ entityType, entityId, payload }) {
+    setRevisionSaving(true);
     setError("");
 
     try {
-      await deleteTargetCo(id);
-    } catch (deleteError) {
-      setError(deleteError.message || "Gagal menghapus Target CO.");
+      await resubmitRevision({
+        entityType,
+        entityId,
+        payload,
+      });
 
-      throw deleteError;
+      await loadRevisionItems();
+
+      await Promise.all([loadProposals(), loadOtsArea(), loadTargetCo()]);
+    } catch (resubmitError) {
+      setError(resubmitError.message || "Gagal mengirim kembali data revisi.");
+
+      throw resubmitError;
     } finally {
-      setTargetDeletingId(null);
+      setRevisionSaving(false);
     }
   }
 
   function renderActiveReport() {
     if (activeMenu === "pusat") {
-      return <ProposalReport proposals={proposals} loading={loading} saving={saving} deletingId={deletingId} onCreate={handleCreateProposal} onDelete={handleDeleteProposal} />;
+      return (
+        <ProposalReport
+          proposals={scopedProposals}
+          cancellationRequests={cancellationRequests}
+          loading={loading}
+          saving={saving}
+          cancellationSubmittingId={cancellationSavingId}
+          onCreate={handleCreateProposal}
+          onUpdatePending={updatePendingProposal}
+          onResubmit={handleResubmitProposal}
+          onRequestCancellation={(id, reason) => handleRequestCancellation("proposal", id, reason)}
+        />
+      );
     }
 
     if (activeMenu === "ots") {
-      return <OtsAreaReport otsArea={otsArea} loading={otsLoading} saving={otsSaving} deletingId={otsDeletingId} onCreate={handleCreateOts} onDelete={handleDeleteOts} />;
+      return (
+        <OtsAreaReport
+          otsArea={scopedOtsArea}
+          loading={otsLoading}
+          saving={otsSaving}
+          deletingId={cancellationSavingId}
+          cancellationRequests={cancellationRequests}
+          cancellationLoading={cancellationLoading}
+          completenessSavingId={otsCompletenessSavingId}
+          onCreate={handleCreateOts}
+          onRequestCancellation={(id, reason) => handleRequestCancellation("ots_area", id, reason)}
+          onUpdateApprovedCompleteness={handleUpdateOtsCompleteness}
+          onUpdatePending={updatePendingOtsArea}
+          onResubmit={(id, payload) => resubmitReport("ots_area", id, payload)}
+        />
+      );
     }
 
     if (activeMenu === "target") {
-      return <TargetCoReport targetCo={targetCo} loading={targetLoading} saving={targetSaving} deletingId={targetDeletingId} onCreate={handleCreateTargetCo} onDelete={handleDeleteTargetCo} />;
+      return (
+        <TargetCoReport
+          targetCo={scopedTargetCo}
+          cancellationRequests={cancellationRequests}
+          loading={targetLoading}
+          saving={targetSaving}
+          cancellationSubmittingId={cancellationSavingId}
+          onCreate={handleCreateTargetCo}
+          onRequestCancellation={(id, reason) => handleRequestCancellation("target_co", id, reason)}
+          onResubmit={resubmitReport}
+        />
+      );
     }
 
-    return (
-      <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
-        <h2 className="text-base font-bold">Menu belum dibuat</h2>
+    if (activeMenu === "revision") {
+      return <RevisionWorkspace items={revisionItems} loading={revisionLoading} saving={revisionSaving} onResubmit={handleResubmitRevision} targetItem={revisionTarget} />;
+    }
 
-        <p className="mt-2 text-sm text-slate-500">Menu ini akan kita kerjakan pada tahap berikutnya.</p>
-      </section>
-    );
+    if (activeMenu === "notification") {
+      return (
+        <NotificationCenter
+          notifications={notifications}
+          onMarkAllRead={markAllAsRead}
+          loading={loading}
+          isOpen={activeMenu === "notification"}
+          onOpen={(notification) => {
+            markAsRead(notification.id);
+
+            const entityType = notification.entity_type;
+            const entityId = notification.entity_id;
+
+            if (entityId && ["proposal", "ots_area", "target_co"].includes(entityType)) {
+              setRevisionTarget({
+                entityType,
+                entityId,
+                token: Date.now(),
+              });
+
+              setActiveMenu("revision");
+              return;
+            }
+
+            // Fallback untuk notifikasi yang tidak terkait record.
+            setActiveMenu("notification");
+          }}
+        />
+      );
+    }
+
+    return null;
   }
 
   return (
-    <div className="min-h-screen text-slate-800">
-      <DashboardHeader activeMenu={activeMenu} onMenuChange={setActiveMenu} />
+    <div
+      className="
+        min-h-screen
+        overflow-x-hidden
+        bg-slate-50
+        text-slate-800
+        dark:bg-slate-950
+        dark:text-slate-100
+      "
+    >
+      {/* Header */}
+      <DashboardHeader />
 
-      <main className="mx-auto max-w-7xl space-y-5 px-3 py-4 sm:px-5 sm:py-6">
-        {error && <div className="clay-surface rounded-2xl border border-red-200/70 bg-red-50/80 px-4 py-3 text-sm font-medium text-red-700">{error}</div>}
+      {/* Main Content */}
+      <main
+        className="
+          mx-auto
+          w-full
+          max-w-7xl
+          space-y-5
+          px-3
+          pb-32
+          pt-4
+          sm:px-5
+          sm:pb-36
+          sm:pt-6
+          lg:px-6
+          lg:pb-40
+        "
+      >
+        {/* Error */}
+        {error && (
+          <div
+            className="
+              rounded-2xl
+              border
+              border-red-200
+              bg-red-50
+              px-4
+              py-3
+              text-sm
+              font-medium
+              text-red-700
+              shadow-sm
+              dark:border-red-900/60
+              dark:bg-red-950/30
+              dark:text-red-400
+            "
+          >
+            {error}
+          </div>
+        )}
 
-        <DashboardStats proposals={proposals} otsArea={otsArea} targetCo={targetCo} />
+        {/* Dashboard Overview */}
+        <DashboardStats proposals={scopedProposals} otsArea={scopedOtsArea} targetCo={scopedTargetCo} unit={salesUnit} />
 
-        <UnitSummary proposals={proposals} otsArea={otsArea} targetCo={targetCo} />
+        <SupervisorFeedbackCard
+          items={attentionNotifications.map((notification) => ({
+            id: notification.id,
 
+            title: notification.title,
+
+            description: notification.message,
+
+            type: notification.type === "REVISION_REQUIRED" ? "Perlu Revisi" : "Ditolak",
+
+            entityType: notification.entity_type,
+
+            entityId: notification.entity_id,
+
+            isRead: notification.is_read,
+          }))}
+          onOpen={(notification) => {
+            markAsRead(notification.id);
+
+            if (notification.entityType === "proposal") {
+              setActiveMenu("pusat");
+
+              return;
+            }
+
+            if (notification.entityType === "ots_area") {
+              setActiveMenu("ots");
+
+              return;
+            }
+
+            if (notification.entityType === "target_co") {
+              setActiveMenu("target");
+            }
+          }}
+        />
+
+        {/* Active Report */}
         {renderActiveReport()}
       </main>
+
+      {/* Bottom Navigation */}
+      <DashboardMenu activeMenu={activeMenu} onChange={setActiveMenu} notificationCount={unreadCount} />
     </div>
   );
 }
